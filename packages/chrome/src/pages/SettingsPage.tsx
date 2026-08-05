@@ -28,6 +28,7 @@ import {
 	type IconDescription,
 } from "../icons";
 import { settingsService } from "..";
+import { INTERNAL_URL_PROTOCOL } from "../consts";
 
 function ThemePreview(this: FC<{ theme: (typeof THEMES)[number] }>) {
 	const theme = this.theme;
@@ -769,8 +770,9 @@ export function SettingsPage(
 				class:active={use(this.selected).map((s) => s === id)}
 				on:click={() => {
 					this.selected = id;
-					// this.tab.url = new URL(`puter://settings/${id}`);
-					this.tab.history.push(new URL(`puter://settings/${id}`));
+					this.tab.history.push(
+						new URL(`${INTERNAL_URL_PROTOCOL}//settings/${id}`)
+					);
 				}}
 			>
 				<Icon icon={icon} />
