@@ -1,0 +1,148 @@
+# Syncs the standalone public repo MercuryWorkshop/scramjet back into the
+# monorepo (HeyPuter/browser.js, under packages/scramjet/), for ALL branches.
+#
+# NOTE on location: this file lives at
+#   packages/scramjet/.github/workflows/sync-to-monorepo.yml
+# in the monorepo, which Copybara maps to
+#   .github/workflows/sync-to-monorepo.yml
+# in MercuryWorkshop/scramjet. It is guarded to run ONLY in
+# MercuryWorkshop/scramjet (the synced copy sitting in the monorepo never runs).
+#
+# How it works:
+#   - Any push (on any branch) migrates that branch's state to the same-named
+#     branch in HeyPuter/browser.js via the `scramjet_to_browserjs` workflow
+#     in copy.bara.sky (nested under packages/scramjet/).
+#   - Loop prevention: commits that already carry a `Browserjs-RevId:` trailer
+#     arrived via the forward sync (monorepo -> public) and are skipped.
+#   - Branch deletions are NOT propagated: deleting a monorepo branch could
+#     destroy unrelated work outside packages/scramjet/. Delete monorepo
+#     branches manually if needed.
+#   - Weekly sweep + manual `branch: all` option backfills any missed branches.
+#
+# Required setup (once, in BOTH HeyPuter/browser.js and
+# MercuryWorkshop/scramjet): create a fine-grained PAT (or classic PAT with
+# `repo` + `workflow` scopes) owned by an account with push access to both
+# repos, and store it as the Actions secret COPYBARA_SYNC_TOKEN.
+
+name: Sync to monorepo
+
+on:
+  push:
+    branches:
+      - "**"
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Branch to sync (or 'all' for every branch)"
+        required: false
+        default: ""
+  schedule:
+    # Weekly safety sweep so no branch drifts out of sync.
+    - cron: "47 4 * * 0"
+
+concurrency:
+  group: copybara-reverse-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    # Only run in the public repo; the copy synced into the monorepo stays idle.
+    if: github.repository == 'MercuryWorkshop/scramjet'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout public repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.COPYBARA_SYNC_TOKEN }}
+
+      - name: Sync branch(es) to HeyPuter/browser.js
+        env:
+          SYNC_TOKEN: ${{ secrets.COPYBARA_SYNC_TOKEN }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_BRANCH: ${{ inputs.branch }}
+          DELETED: ${{ github.event.deleted }}
+          PUSH_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          echo "::add-mask::$SYNC_TOKEN"
+
+          MONOREPO="HeyPuter/browser.js"
+          PUBLIC="MercuryWorkshop/scramjet"
+          WORKFLOW="scramjet_to_browserjs"
+          CONFIG="copy.bara.sky"
+          DEST_URL="https://x-access-token:${SYNC_TOKEN}@github.com/${MONOREPO}.git"
+
+          sync_branch() {
+            local BRANCH="$1"
+
+            # Loop guard: skip commits that came from the forward sync.
+            local MSG
+            MSG="$(git log -1 --format=%B "origin/${BRANCH}" 2>/dev/null || true)"
+            if grep -q 'Browserjs-RevId:' <<<"$MSG"; then
+              echo "Skipping ${BRANCH}: tip already carries Browserjs-RevId (forward-synced)."
+              return 0
+            fi
+            if grep -q '\[skip copybara\]' <<<"$MSG"; then
+              echo "Skipping ${BRANCH}: tip carries [skip copybara]."
+              return 0
+            fi
+
+            local FORCE=""
+            if ! git ls-remote --exit-code --heads "$DEST_URL" "$BRANCH" >/dev/null 2>&1; then
+              echo "Destination branch ${BRANCH} does not exist yet; initializing with --force."
+              FORCE="--force"
+            fi
+
+            echo "Migrating ${BRANCH} -> ${MONOREPO}:${BRANCH} (packages/scramjet/)"
+            set +e
+            docker run --rm \
+              -v "$GITHUB_WORKSPACE:/workspace" -w /workspace \
+              gcr.io/copybara/copybara:latest \
+              migrate "$CONFIG" "$WORKFLOW" \
+              --git-origin-url "https://x-access-token:${SYNC_TOKEN}@github.com/${PUBLIC}.git" \
+              --git-destination-url "$DEST_URL" \
+              --git-origin-ref "$BRANCH" \
+              --git-destination-fetch "$BRANCH" \
+              --git-destination-push "$BRANCH" \
+              --git-committer-name "Copybara Sync" \
+              --git-committer-email "copybara@users.noreply.github.com" \
+              $FORCE
+            local CODE=$?
+            set -e
+            if [ "$CODE" -eq 4 ]; then
+              echo "Already in sync (${BRANCH})."
+              return 0
+            fi
+            if [ "$CODE" -ne 0 ]; then
+              echo "::error::Copybara failed for ${BRANCH} (exit ${CODE})"
+              return "$CODE"
+            fi
+          }
+
+          # Never propagate branch deletions into the monorepo: a monorepo
+          # branch can hold work outside packages/scramjet/.
+          if [ "$EVENT_NAME" = "push" ] && [ "$DELETED" = "true" ]; then
+            echo "Source branch ${PUSH_REF#refs/heads/} was deleted; NOT deleting it in ${MONOREPO} (manual cleanup if desired)."
+            exit 0
+          fi
+
+          TARGET="${INPUT_BRANCH:-$REF_NAME}"
+          if [ "$EVENT_NAME" = "schedule" ] && [ -z "${INPUT_BRANCH:-}" ]; then
+            TARGET="all"
+          fi
+
+          if [ "$TARGET" = "all" ]; then
+            echo "Syncing all branches..."
+            git fetch origin '+refs/heads/*:refs/remotes/origin/*'
+            for B in $(git branch -r --format='%(refname:lstrip=3)' | grep -vx 'HEAD'); do
+              [ -z "$B" ] && continue
+              sync_branch "$B"
+            done
+          else
+            sync_branch "$TARGET"
+          fi
